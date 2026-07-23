@@ -1,220 +1,224 @@
 """
-Vision and Multimodal Support
+Vision and Multimodal Module
 =============================
-Handles image data in conversations.
-Converts inline_data images to Ollama vision model format.
-Maintains public API compatibility while supporting multimodal inputs.
+Handles image/vision processing for multimodal AI interactions.
+Accepts inline_data images from send_client_content(), converts to Ollama vision format.
+Maintains compatibility with Gemini Live API while supporting local vision models.
 """
 
 import base64
-from typing import Optional, Tuple, Dict, Any
+import io
+from typing import Optional, Dict, Any, Tuple
+# TODO: Import PIL/Pillow for image processing
+# TODO: Import numpy for image manipulation if needed
 
 
 class ImageProcessor:
     """
-    Processes images for vision model integration.
-    Converts between formats and validates image data.
-    """
-
-    SUPPORTED_MIME_TYPES = {
-        "image/jpeg": "jpg",
-        "image/png": "png",
-        "image/webp": "webp",
-        "image/gif": "gif",
-    }
-
-    @staticmethod
-    def validate_mime_type(mime_type: str) -> bool:
-        """
-        Validate image MIME type is supported.
-        
-        Args:
-            mime_type: MIME type string
-            
-        Returns:
-            True if supported, False otherwise
-        """
-        return mime_type in ImageProcessor.SUPPORTED_MIME_TYPES
-
-    @staticmethod
-    def encode_image_for_ollama(image_data: bytes, mime_type: str) -> Dict[str, Any]:
-        """
-        Convert image data to Ollama vision model format.
-        
-        Args:
-            image_data: Raw image bytes
-            mime_type: Image MIME type (e.g., "image/jpeg")
-            
-        Returns:
-            Dict with base64 encoded image and type for Ollama
-            
-        Example:
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": "base64_encoded_string"
-                }
-            }
-        """
-        if not ImageProcessor.validate_mime_type(mime_type):
-            raise ValueError(f"Unsupported MIME type: {mime_type}")
-        
-        # Encode to base64
-        b64_data = base64.b64encode(image_data).decode("ascii")
-        
-        return {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime_type,
-                "data": b64_data
-            }
-        }
-
-    @staticmethod
-    def extract_inline_data(part: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
-        """
-        Extract image data from inline_data part in turn.
-        
-        Args:
-            part: Dict part from turns["parts"] containing inline_data
-                  Example: {"inline_data": {"mime_type": "image/jpeg", "data": "base64_string"}}
-            
-        Returns:
-            Tuple of (image_bytes, mime_type) or None if not image data
-        """
-        if not isinstance(part, dict):
-            return None
-        
-        inline_data = part.get("inline_data")
-        if not inline_data or not isinstance(inline_data, dict):
-            return None
-        
-        mime_type = inline_data.get("mime_type", "")
-        data_str = inline_data.get("data", "")
-        
-        if not mime_type or not data_str:
-            return None
-        
-        if not ImageProcessor.validate_mime_type(mime_type):
-            return None
-        
-        try:
-            # Decode base64 data
-            image_bytes = base64.b64decode(data_str)
-            return (image_bytes, mime_type)
-        except Exception as e:
-            print(f"[Vision] Failed to decode image: {e}")
-            return None
-
-
-class MultimodalContext:
-    """
-    Manages multimodal context in conversation.
-    Tracks images and text in the same turn.
+    Image processing for vision model compatibility.
+    Converts between formats (base64, bytes, PIL Image).
+    Validates and prepares images for model input.
     """
 
     def __init__(self):
-        """Initialize multimodal context."""
-        self.images: list = []  # List of encoded images
-        self.text_parts: list = []  # List of text parts
-        self.media_metadata: Dict[str, Any] = {}  # Metadata about media
+        """Initialize image processor."""
+        self.supported_formats = ["image/jpeg", "image/png", "image/webp", "image/gif"]
 
-    def add_image(self, image_bytes: bytes, mime_type: str) -> bool:
+    def decode_inline_data(self, inline_data: Dict[str, str]) -> Tuple[bytes, str]:
         """
-        Add image to context.
+        Decode base64 inline image data.
+        
+        Args:
+            inline_data: Dict with "mime_type" and "data" (base64 string)
+                        Example: {"mime_type": "image/png", "data": "iVBOR..."}
+            
+        Returns:
+            Tuple of (image bytes, mime_type)
+        """
+        mime_type = inline_data.get("mime_type", "image/jpeg")
+        data_b64 = inline_data.get("data", "")
+        
+        try:
+            image_bytes = base64.b64decode(data_b64)
+            return image_bytes, mime_type
+        except Exception as e:
+            print(f"[Vision] Decode error: {e}")
+            return b"", mime_type
+
+    def encode_to_base64(self, image_bytes: bytes) -> str:
+        """
+        Encode image bytes to base64 string.
         
         Args:
             image_bytes: Raw image bytes
-            mime_type: Image MIME type
             
         Returns:
-            True if added successfully
+            Base64 encoded string
         """
-        try:
-            encoded = ImageProcessor.encode_image_for_ollama(image_bytes, mime_type)
-            self.images.append(encoded)
-            self.media_metadata[f"image_{len(self.images)}"] = {
-                "mime_type": mime_type,
-                "size": len(image_bytes)
-            }
-            return True
-        except Exception as e:
-            print(f"[Multimodal] Failed to add image: {e}")
-            return False
+        return base64.b64encode(image_bytes).decode("ascii")
 
-    def add_text(self, text: str):
-        """Add text to context."""
-        if text:
-            self.text_parts.append(text)
-
-    def build_message_content(self) -> list:
+    def validate_image(self, image_bytes: bytes, mime_type: str) -> bool:
         """
-        Build Ollama message content with images and text.
-        
-        Returns:
-            List of content parts for Ollama message
-        """
-        content = []
-        
-        # Add images first
-        content.extend(self.images)
-        
-        # Add text as a single part
-        if self.text_parts:
-            content.append({
-                "type": "text",
-                "text": " ".join(self.text_parts)
-            })
-        
-        return content if content else [{"type": "text", "text": ""}]
-
-    def has_images(self) -> bool:
-        """Check if context contains images."""
-        return len(self.images) > 0
-
-    def clear(self):
-        """Clear all multimodal context."""
-        self.images.clear()
-        self.text_parts.clear()
-        self.media_metadata.clear()
-
-
-class VisionCapabilities:
-    """
-    Manages vision model capabilities and settings.
-    """
-
-    def __init__(self):
-        """Initialize vision capabilities."""
-        self.enabled = True
-        self.max_image_size = 20 * 1024 * 1024  # 20 MB
-        self.supported_models = ["llava", "llava-13b", "bakllava"]
-        self.current_model = "llava"
-
-    def is_vision_capable(self, model: str) -> bool:
-        """
-        Check if model supports vision.
-        
-        Args:
-            model: Model name
-            
-        Returns:
-            True if model can process images
-        """
-        # TODO: Query Ollama for model capabilities
-        return model.lower() in self.supported_models or "llava" in model.lower()
-
-    def validate_image(self, image_bytes: bytes) -> bool:
-        """
-        Validate image before sending to model.
+        Validate image format and size.
         
         Args:
             image_bytes: Image data
+            mime_type: MIME type
             
         Returns:
-            True if image is valid
+            True if valid, False otherwise
         """
-        return len(image_bytes) <= self.max_image_size
+        if mime_type not in self.supported_formats:
+            return False
+        
+        if len(image_bytes) > 20 * 1024 * 1024:  # 20 MB limit
+            return False
+        
+        # TODO: Validate image header/magic bytes
+        return True
+
+    def resize_image(
+        self,
+        image_bytes: bytes,
+        max_width: int = 1024,
+        max_height: int = 1024
+    ) -> bytes:
+        """
+        Resize image to fit model constraints.
+        
+        Args:
+            image_bytes: Original image bytes
+            max_width: Maximum width in pixels
+            max_height: Maximum height in pixels
+            
+        Returns:
+            Resized image bytes
+        """
+        # TODO: Use PIL to load, resize, and save image
+        # For now, return original
+        return image_bytes
+
+    def get_image_format_suffix(self, mime_type: str) -> str:
+        """Get file extension from MIME type."""
+        mapping = {
+            "image/jpeg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "image/gif": "gif"
+        }
+        return mapping.get(mime_type, "jpg")
+
+
+class VisionContext:
+    """
+    Manages images in conversation context.
+    Stores images and maintains references in conversation history.
+    """
+
+    def __init__(self):
+        """Initialize vision context."""
+        self.images: Dict[str, Dict[str, Any]] = {}  # image_id -> image data
+        self.image_counter = 0
+
+    def add_image(self, image_bytes: bytes, mime_type: str) -> str:
+        """
+        Add image to context and return ID.
+        
+        Args:
+            image_bytes: Image data
+            mime_type: MIME type
+            
+        Returns:
+            Image ID for reference
+        """
+        self.image_counter += 1
+        image_id = f"image_{self.image_counter}"
+        
+        self.images[image_id] = {
+            "bytes": image_bytes,
+            "mime_type": mime_type,
+            "size": len(image_bytes)
+        }
+        
+        return image_id
+
+    def get_image(self, image_id: str) -> Optional[Dict[str, Any]]:
+        """Get image data by ID."""
+        return self.images.get(image_id)
+
+    def clear(self):
+        """Clear all stored images."""
+        self.images.clear()
+        self.image_counter = 0
+
+
+class OllamaVisionFormatter:
+    """
+    Formats images for Ollama vision model API.
+    Converts Gemini-style inline_data to Ollama format.
+    """
+
+    @staticmethod
+    def format_for_ollama(inline_data: Dict[str, str]) -> Dict[str, str]:
+        """
+        Convert inline_data to Ollama vision format.
+        
+        Args:
+            inline_data: Gemini format with "mime_type" and "data" (base64)
+            
+        Returns:
+            Dict with Ollama-compatible image representation
+        """
+        mime_type = inline_data.get("mime_type", "image/jpeg")
+        data_b64 = inline_data.get("data", "")
+        
+        # Ollama expects base64 data in message content
+        return {
+            "type": "image",
+            "mime_type": mime_type,
+            "data": data_b64  # Keep as base64
+        }
+
+    @staticmethod
+    def build_vision_message(text: str, images: list) -> Dict[str, Any]:
+        """
+        Build a message with text and images for Ollama.
+        
+        Args:
+            text: Text prompt
+            images: List of image dicts with "mime_type" and "data"
+            
+        Returns:
+            Message dict for Ollama /api/chat
+        """
+        content = text
+        
+        # TODO: If Ollama supports multimodal in message format,
+        # include images here. For now, return simple text message.
+        
+        return {
+            "role": "user",
+            "content": content,
+            "images": images if images else None
+        }
+
+
+# Global vision components
+_image_processor: Optional[ImageProcessor] = None
+_vision_context: Optional[VisionContext] = None
+
+
+def get_image_processor() -> ImageProcessor:
+    """Get or create global image processor."""
+    global _image_processor
+    if _image_processor is None:
+        _image_processor = ImageProcessor()
+    return _image_processor
+
+
+def get_vision_context() -> VisionContext:
+    """Get or create global vision context."""
+    global _vision_context
+    if _vision_context is None:
+        _vision_context = VisionContext()
+    return _vision_context
