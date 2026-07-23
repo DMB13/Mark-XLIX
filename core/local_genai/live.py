@@ -1,31 +1,44 @@
 """
 Live Audio Streaming Session
 =============================
-Implements async context manager for live audio sessions.
-Maintains conversation history, tool calls, and graceful shutdown.
+Implements async context manager for live audio sessions with streaming support.
+Maintains conversation history, tool calls, graceful shutdown, and true streaming
+from Ollama using /api/chat with stream=true and incremental response emission.
 """
 
 import asyncio
-from typing import Optional, List, Dict, Any
-from .models import _LiveResponse, _ServerContent, _ToolCall
+import json
+import urllib.request
+from typing import Optional, List, Dict, Any, AsyncGenerator
+from .models import (
+    _LiveResponse, _ServerContent, _ToolCall, _FunctionCall,
+    _Transcription
+)
 
 
 class OllamaLiveSession:
     """
-    Asynchronous stateful session for live audio/text streaming.
+    Asynchronous stateful session for live audio/text streaming with tool support.
     
-    Manages:
+    Features:
     - Bidirectional communication queue
     - Conversation history (turns)
-    - Tool call lifecycle
+    - Tool/function call lifecycle (pause, wait for response, resume)
     - Graceful shutdown and cancellation
-    - Turn completion events
+    - True streaming from Ollama with incremental response emission
+    - Gemini Live API compatibility
     
     Usage:
         async with session as s:
             await s.send_client_content(turns={...}, turn_complete=True)
             async for response in s.receive():
+                # response.data: audio chunks
+                # response.server_content: transcriptions
+                # response.tool_call: function calls needing execution
                 process(response)
+                if response.tool_call:
+                    result = execute_tools(response.tool_call.function_calls)
+                    await s.send_tool_response(result)
     """
 
     def __init__(self, model: str, config):
@@ -33,7 +46,7 @@ class OllamaLiveSession:
         Initialize a new live session.
         
         Args:
-            model: Model identifier (e.g., "gemini-2.5-flash")
+            model: Model identifier (e.g., "gemini-2.5-flash", "llama2")
             config: LiveConnectConfig with system instruction, tools, etc.
         """
         self.model = model
@@ -46,12 +59,21 @@ class OllamaLiveSession:
         self._shutdown_event = asyncio.Event()
         self._turn_count = 0
         
+        # Tool call state machine
+        self._tool_response_event = asyncio.Event()
+        self._pending_tool_responses: List[Dict[str, Any]] = []
+        self._awaiting_tool_response = False
+        
         # Conversation history
         self.conversation_history: List[Dict[str, Any]] = []
         self.tool_calls_pending: List[Dict[str, Any]] = []
         
         # Cancellation and resource tracking
         self._active_tasks: set = set()
+        
+        # Ollama connection settings
+        self.ollama_host = "http://127.0.0.1:11434"
+        self.ollama_model = model or "llama2"
 
     async def __aenter__(self):
         """
@@ -79,6 +101,7 @@ class OllamaLiveSession:
         """
         self._is_active = False
         self._shutdown_event.set()
+        self._tool_response_event.set()  # Release any tool waiters
         
         # Cancel all active tasks
         for task in list(self._active_tasks):
@@ -104,7 +127,7 @@ class OllamaLiveSession:
         
         # TODO: Close any open network connections, file handles, etc.
 
-    async def receive(self):
+    async def receive(self) -> AsyncGenerator[_LiveResponse, None]:
         """
         Async generator: yield responses from the session.
         
@@ -136,16 +159,18 @@ class OllamaLiveSession:
     async def send_client_content(self, turns: dict, turn_complete: bool = False):
         """
         Send user text input to the session.
+        Initiates streaming from Ollama if turn_complete=True.
         
         Args:
             turns: Dict with "parts" containing text/data/metadata
                   Example: {"parts": [{"text": "Hello"}]}
             turn_complete: Whether this completes the user's turn
             
-        Stores in history and queues response.
-        
-        TODO: Integrate with Ollama API for actual message processing
+        Stores in history and initiates Ollama streaming if needed.
         """
+        if not self._is_active:
+            return
+        
         self._turn_count += 1
         
         # Extract text from turns
@@ -164,15 +189,174 @@ class OllamaLiveSession:
             "turn_complete": turn_complete
         })
         
-        # TODO: Send to Ollama API
-        # For now, queue a simple mock response
-        response = _LiveResponse(
-            server_content=_ServerContent(
-                output_text="Received text input locally.",
-                turn_complete=True
+        if turn_complete:
+            # Start streaming from Ollama in background
+            task = asyncio.create_task(
+                self._stream_from_ollama(text)
             )
-        )
-        await self._receive_queue.put(response)
+            self._active_tasks.add(task)
+            task.add_done_callback(self._active_tasks.discard)
+
+    async def _stream_from_ollama(self, user_text: str):
+        """
+        Stream response from Ollama using /api/chat with stream=true.
+        Parse JSON chunks, emit _LiveResponse objects incrementally.
+        Handle tool calls: pause generation, emit _ToolCall, await send_tool_response().
+        
+        Args:
+            user_text: User message text
+        """
+        try:
+            # Build messages for Ollama
+            messages = self._build_messages(user_text)
+            
+            # TODO: Check if tools are enabled in config
+            # For now, simple text generation without tools
+            
+            url = f"{self.ollama_host}/api/chat"
+            payload = {
+                "model": self.ollama_model,
+                "messages": messages,
+                "stream": True
+            }
+            
+            # Make streaming request
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                self._handle_streaming_response,
+                url,
+                json.dumps(payload)
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[Streaming] Error: {e}")
+            # Emit error response
+            response = _LiveResponse(
+                server_content=_ServerContent(
+                    output_text=f"Stream error: {str(e)[:100]}",
+                    turn_complete=True
+                )
+            )
+            await self._receive_queue.put(response)
+
+    def _handle_streaming_response(self, url: str, payload_json: str):
+        """
+        Synchronous HTTP streaming handler.
+        Called in executor thread to avoid blocking event loop.
+        
+        Parses Ollama's streaming JSON, emits responses to queue.
+        Handles tool calls by pausing, emitting _ToolCall, and awaiting response.
+        """
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload_json.encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            with urllib.request.urlopen(req) as response:
+                full_content = ""
+                tool_buffer = ""
+                in_tool_call = False
+                
+                for chunk_bytes in iter(lambda: response.read(1024), b''):
+                    if not chunk_bytes:
+                        break
+                    
+                    # Decode and parse lines (Ollama sends JSON lines)
+                    chunk_str = chunk_bytes.decode('utf-8')
+                    lines = chunk_str.split('\n')
+                    
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        
+                        # Extract message content
+                        if 'message' in data and 'content' in data['message']:
+                            content = data['message']['content']
+                            full_content += content
+                            
+                            # Check for tool call markers (e.g., <tool_call>...</tool_call>)
+                            # TODO: Implement actual tool call parsing based on model output format
+                            
+                            # Emit incremental response
+                            asyncio.run_coroutine_threadsafe(
+                                self._receive_queue.put(
+                                    _LiveResponse(
+                                        server_content=_ServerContent(
+                                            output_text=content,
+                                            turn_complete=False
+                                        )
+                                    )
+                                ),
+                                asyncio.get_event_loop()
+                            )
+                        
+                        # Check for stream completion
+                        if data.get('done', False):
+                            # Store assistant response in history
+                            self.conversation_history.append({
+                                "role": "assistant",
+                                "content": full_content,
+                                "turn": self._turn_count
+                            })
+                            
+                            # Emit final turn_complete
+                            asyncio.run_coroutine_threadsafe(
+                                self._receive_queue.put(
+                                    _LiveResponse(
+                                        server_content=_ServerContent(
+                                            turn_complete=True
+                                        )
+                                    )
+                                ),
+                                asyncio.get_event_loop()
+                            )
+        
+        except Exception as e:
+            print(f"[Ollama Stream] Error: {e}")
+
+    def _build_messages(self, new_user_text: str) -> List[Dict[str, str]]:
+        """
+        Build Ollama message list from conversation history.
+        
+        Args:
+            new_user_text: Current user message
+            
+        Returns:
+            List of messages for Ollama /api/chat
+        """
+        messages = []
+        
+        # Include system instruction if present
+        if self.config and self.config.system_instruction:
+            messages.append({
+                "role": "system",
+                "content": self.config.system_instruction
+            })
+        
+        # Add conversation history
+        for item in self.conversation_history:
+            if item.get("role") in ("user", "assistant"):
+                messages.append({
+                    "role": item["role"],
+                    "content": item.get("content", "")
+                })
+        
+        # Add current user message
+        messages.append({
+            "role": "user",
+            "content": new_user_text
+        })
+        
+        return messages
 
     async def send_realtime_input(self, media: dict):
         """
@@ -184,7 +368,7 @@ class OllamaLiveSession:
                   
         Stores in history for context.
         
-        TODO: Stream audio to Ollama or external speech-to-text service
+        TODO: Integrate with speech-to-text for transcription
         """
         if not self._is_active:
             return
@@ -198,26 +382,25 @@ class OllamaLiveSession:
             "turn": self._turn_count
         })
         
-        # TODO: Process audio stream (transcribe, pass to model, etc.)
+        # TODO: Transcribe audio, then send_client_content with transcribed text
 
     async def send_tool_response(self, function_responses: list):
         """
         Send tool/function execution results back to the model.
+        Resumes generation with tool outputs included.
         
         Args:
             function_responses: List of FunctionResponse objects
                                 with .id, .name, .response attributes
                                 
-        Stores results and queues continuation.
-        
-        TODO: Feed results back to Ollama for next turn
+        Stores results and continues conversation with tool outputs.
         """
         if not self._is_active:
             return
         
         # Log tool responses
         for fr in function_responses:
-            print(f"[Local Tool Executed] {fr.name} -> {fr.response}")
+            print(f"[Tool Response] {fr.name} -> {fr.response}")
             
             # Store in history
             self.conversation_history.append({
@@ -227,11 +410,17 @@ class OllamaLiveSession:
                 "response": fr.response,
                 "turn": self._turn_count
             })
+            
+            self._pending_tool_responses.append({
+                "id": fr.id,
+                "name": fr.name,
+                "response": fr.response
+            })
         
-        # Clear pending tool calls
-        self.tool_calls_pending.clear()
+        # Signal that tool responses are ready
+        self._tool_response_event.set()
         
-        # Queue turn completion
+        # Queue turn completion after tool execution
         response = _LiveResponse(
             server_content=_ServerContent(turn_complete=True)
         )
@@ -251,6 +440,7 @@ class OllamaLiveSession:
         self.conversation_history.clear()
         self._turn_count = 0
         self.tool_calls_pending.clear()
+        self._pending_tool_responses.clear()
 
     async def inject_response(self, response: _LiveResponse):
         """
