@@ -1,0 +1,8 @@
+# Secrets
+config/api_keys.json
+config/certs/*.key
+.env
+
+# Python
+__pycache__/
+*.pyc
